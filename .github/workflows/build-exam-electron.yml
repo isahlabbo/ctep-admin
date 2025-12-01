@@ -4,103 +4,71 @@ on:
   workflow_dispatch:
     inputs:
       exam_sql_url:
-        description: 'Public or signed URL to the exam .sqlite file (required)'
+        description: "Signed URL of the sqlite exam file"
         required: true
-        type: string
       exam_filename:
-        description: 'Filename to save as inside the app (e.g. exam.sqlite)'
-        required: false
-        default: 'exam.sqlite'
-      node_version:
-        description: 'Node.js version'
-        required: false
-        default: '20'
-      retain_artifacts_days:
-        description: 'Artifact retention days'
-        required: false
-        default: 7
+        description: "Original filename of the sqlite file"
+        required: true
+      build_id:
+        description: "Unique ID for this build"
+        required: true
+      callback_url:
+        description: "Where to POST the final .exe installer"
+        required: true
 
 jobs:
   build:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    env:
-      EXAM_SQL_URL: ${{ github.event.inputs.exam_sql_url }}
-      EXAM_FILENAME: ${{ github.event.inputs.exam_filename }}
-      NODE_VERSION: ${{ github.event.inputs.node_version }}
-      RETENTION_DAYS: ${{ github.event.inputs.retain_artifacts_days }}
+    runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
+      # 1. Checkout source code
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Node.js
+      # 2. Set up Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          node-version: 18
 
-      - name: Ensure assets dir
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: npm install
+
+      # 4. Create build directory for sqlite database
+      - name: Create data directory
+        run: mkdir -p ./data
+
+      # 5. Download sqlite DB sent from Laravel
+      - name: Download sqlite file
         run: |
-          mkdir -p assets
+          curl -L "${{ github.event.inputs.exam_sql_url }}" -o "./data/${{ github.event.inputs.exam_filename }}"
+      
+      # 6. Confirm file exists
+      - name: Show downloaded DB
+        run: dir ./data
 
-      - name: Download exam sqlite
+      # 7. Build Electron app using electron-builder
+      - name: Build Electron App (Windows)
         run: |
-          echo "Downloading exam from $EXAM_SQL_URL"
-          curl -fSL "$EXAM_SQL_URL" -o "assets/${EXAM_FILENAME}"
-        shell: bash
+          npx electron-builder --win --config electron-builder.yml
 
-      - name: Install dependencies (npm ci)
+      # 8. Upload artifact from dist
+      - name: Find generated EXE
+        id: find_exe
         run: |
-          npm ci
+          $file = Get-ChildItem -Path "dist" -Filter *.exe | Select-Object -First 1
+          echo "FILE_PATH=$($file.FullName)" >> $env:GITHUB_ENV
+          echo "Found: $($file.FullName)"
 
-      - name: Build frontend (if any)
+      # 9. POST installer back to Laravel callback URL
+      - name: Upload installer to Laravel
         run: |
-          if npm run | grep -q 'build'; then
-            npm run build || echo "No build script"
-          fi
-        shell: bash
+          curl -X POST "${{ github.event.inputs.callback_url }}" ^
+          -H "Content-Type: multipart/form-data" ^
+          -F "build_id=${{ github.event.inputs.build_id }}" ^
+          -F "file=@${{ env.FILE_PATH }}"
 
-      - name: Show node & electron-builder versions
-        run: |
-          node -v
-          npx electron-builder --version || true
-        shell: bash
-
-      - name: Run electron-builder (platform-specific)
-        run: |
-          set -o errexit
-          # macOS build
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            echo "Building macOS app..."
-            npx electron-builder --mac --x64 --arm64 --publish never
-          fi
-          # Windows build
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            echo "Building Windows app..."
-            npx electron-builder --windows --x64 --publish never
-          fi
-          # Linux build
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            echo "Building Linux app..."
-            npx electron-builder --linux --x64 --arm64 --publish never
-          fi
-        shell: bash
-
-      - name: List dist directory
-        run: |
-          echo "Contents of dist/:"
-          ls -la dist || true
-        shell: bash
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: "exam-${{ github.run_id }}-${{ matrix.os }}"
-          path: dist/**
-          retention-days: ${{ env.RETENTION_DAYS }}
+      # 10. Mark workflow success
+      - name: Completed
+        run: echo "Build completed successfully"
