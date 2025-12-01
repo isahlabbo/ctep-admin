@@ -1,0 +1,106 @@
+name: Build Exam Electron App
+
+on:
+  workflow_dispatch:
+    inputs:
+      exam_sql_url:
+        description: 'Public or signed URL to the exam .sqlite file (required)'
+        required: true
+        type: string
+      exam_filename:
+        description: 'Filename to save as inside the app (e.g. exam.sqlite)'
+        required: false
+        default: 'exam.sqlite'
+      node_version:
+        description: 'Node.js version'
+        required: false
+        default: '20'
+      retain_artifacts_days:
+        description: 'Artifact retention days'
+        required: false
+        default: 7
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      EXAM_SQL_URL: ${{ github.event.inputs.exam_sql_url }}
+      EXAM_FILENAME: ${{ github.event.inputs.exam_filename }}
+      NODE_VERSION: ${{ github.event.inputs.node_version }}
+      RETENTION_DAYS: ${{ github.event.inputs.retain_artifacts_days }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Ensure assets dir
+        run: |
+          mkdir -p assets
+
+      - name: Download exam sqlite
+        run: |
+          echo "Downloading exam from $EXAM_SQL_URL"
+          curl -fSL "$EXAM_SQL_URL" -o "assets/${EXAM_FILENAME}"
+        shell: bash
+
+      - name: Install dependencies (npm ci)
+        run: |
+          npm ci
+
+      - name: Build frontend (if any)
+        run: |
+          if npm run | grep -q 'build'; then
+            npm run build || echo "No build script"
+          fi
+        shell: bash
+
+      - name: Show node & electron-builder versions
+        run: |
+          node -v
+          npx electron-builder --version || true
+        shell: bash
+
+      - name: Run electron-builder (platform-specific)
+        run: |
+          set -o errexit
+          # macOS build
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            echo "Building macOS app..."
+            npx electron-builder --mac --x64 --arm64 --publish never
+          fi
+          # Windows build
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "Building Windows app..."
+            npx electron-builder --windows --x64 --publish never
+          fi
+          # Linux build
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            echo "Building Linux app..."
+            npx electron-builder --linux --x64 --arm64 --publish never
+          fi
+        shell: bash
+
+      - name: List dist directory
+        run: |
+          echo "Contents of dist/:"
+          ls -la dist || true
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "exam-${{ github.run_id }}-${{ matrix.os }}"
+          path: dist/**
+          retention-days: ${{ env.RETENTION_DAYS }}
