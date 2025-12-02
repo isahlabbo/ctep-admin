@@ -19,56 +19,173 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 120
 
     steps:
-      # 1. Checkout source code
+      # 1) Checkout repo
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2. Set up Node.js
-      - name: Setup Node
+      # 2) Setup Node.js (cache npm)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: 'npm'
 
-      # 3. Install dependencies
+      # 3) Install dependencies
       - name: Install dependencies
-        run: npm install
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      # 4. Create build directory for sqlite database
+      # 4) Create data directory
       - name: Create data directory
+        shell: bash
         run: mkdir -p ./data
 
-      # 5. Download sqlite DB sent from Laravel
-      - name: Download sqlite file
+      # 5) Debug inputs
+      - name: Debug: print inputs
+        shell: bash
         run: |
-          curl -L "${{ github.event.inputs.exam_sql_url }}" -o "./data/${{ github.event.inputs.exam_filename }}"
-      
-      # 6. Confirm file exists
-      - name: Show downloaded DB
-        run: dir ./data
+          echo "exam_sql_url=${{ github.event.inputs.exam_sql_url }}"
+          echo "exam_filename=${{ github.event.inputs.exam_filename }}"
+          echo "build_id=${{ github.event.inputs.build_id }}"
+          echo "callback_url=${{ github.event.inputs.callback_url }}"
 
-      # 7. Build Electron app using electron-builder
-      - name: Build Electron App (Windows)
+      # 6) Download sqlite file with retry
+      - name: Download sqlite file
+        id: download_sqlite
+        shell: bash
+        env:
+          EXAM_SQL_URL: ${{ github.event.inputs.exam_sql_url }}
+          EXAM_FILENAME: ${{ github.event.inputs.exam_filename }}
         run: |
+          set -euo pipefail
+          echo "Downloading sqlite from: $EXAM_SQL_URL"
+          mkdir -p data debug_artifact
+          echo "$EXAM_SQL_URL" > debug_artifact/exam_sql_url.txt
+
+          LOG=debug_artifact/download.log
+          HEADERS=debug_artifact/headers_last.txt
+          rm -f $LOG $HEADERS || true
+
+          MAX=3
+          SLEEP=3
+          i=0
+          while [ $i -lt $MAX ]; do
+            i=$((i+1))
+            echo "Attempt #$i" | tee -a $LOG
+            curl -fSL -D $HEADERS -o "data/$EXAM_FILENAME" -v "$EXAM_SQL_URL" 2>> $LOG || true
+            if [ -s "data/$EXAM_FILENAME" ]; then
+              echo "Downloaded data/$EXAM_FILENAME (attempt #$i)" | tee -a $LOG
+              ls -l "data/$EXAM_FILENAME" | tee -a $LOG
+              break
+            fi
+            echo "Attempt #$i failed, sleeping $SLEEP seconds" | tee -a $LOG
+            sleep $SLEEP
+            SLEEP=$((SLEEP * 2))
+          done
+
+          if [ ! -s "data/$EXAM_FILENAME" ]; then
+            echo "ERROR: Failed to download sqlite after $MAX attempts" | tee -a $LOG
+            echo "--- curl HEAD ---" >> $LOG
+            cat $HEADERS >> $LOG || true
+            exit 1
+          fi
+
+      # 7) Upload debug logs if download failed
+      - name: Upload download debug logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-debug-${{ github.run_id }}
+          path: debug_artifact/**
+
+      # 8) Show downloaded DB
+      - name: Show downloaded DB
+        shell: bash
+        run: |
+          echo "Contents of data/:"
+          ls -la data || true
+
+      # 9) Build Electron app
+      - name: Build Electron App (Windows)
+        shell: bash
+        run: |
+          if npm run | grep -q 'build'; then
+            npm run build || true
+          fi
           npx electron-builder --win --config electron-builder.yml
 
-      # 8. Upload artifact from dist
-      - name: Find generated EXE
+      # 10) Find generated EXE
+      - name: Find generated EXE (PowerShell)
         id: find_exe
+        shell: pwsh
         run: |
-          $file = Get-ChildItem -Path "dist" -Filter *.exe | Select-Object -First 1
-          echo "FILE_PATH=$($file.FullName)" >> $env:GITHUB_ENV
-          echo "Found: $($file.FullName)"
+          $file = Get-ChildItem -Path "dist" -Recurse -Filter *.exe | Select-Object -First 1
+          if ($null -eq $file) {
+            Write-Host "NO_EXE_FOUND"
+            exit 2
+          }
+          Write-Host "Found EXE: $($file.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value ("FILE_PATH=$($file.FullName)")
 
-      # 9. POST installer back to Laravel callback URL
-      - name: Upload installer to Laravel
+      # 11) Upload installer to Laravel callback
+      - name: Upload installer to Laravel callback (PowerShell)
+        id: upload_callback
+        shell: pwsh
+        env:
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+          FILE_PATH: ${{ env.FILE_PATH }}
         run: |
-          curl -X POST "${{ github.event.inputs.callback_url }}" ^
-          -H "Content-Type: multipart/form-data" ^
-          -F "build_id=${{ github.event.inputs.build_id }}" ^
-          -F "file=@${{ env.FILE_PATH }}"
+          if (-not (Test-Path $env:FILE_PATH)) {
+            Write-Host "Installer not found at $env:FILE_PATH"
+            exit 2
+          }
+          Write-Host "Posting installer $env:FILE_PATH to $env:CALLBACK_URL"
+          $headers = @{ "X-BUILD-CALLBACK-TOKEN" = "${{ secrets.BUILD_CALLBACK_TOKEN }}" }
+          try {
+            $form = @{}
+            $form.Add("build_id", $env:BUILD_ID)
+            $fileStream = [System.IO.File]::OpenRead($env:FILE_PATH)
+            $content = New-Object System.Net.Http.MultipartFormDataContent
+            $fileContent = New-Object System.Net.Http.StreamContent($fileStream)
+            $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/octet-stream")
+            $content.Add($fileContent, "artifact", [System.IO.Path]::GetFileName($env:FILE_PATH))
+            $content.Add([System.Net.Http.StringContent]::new($env:BUILD_ID), "build_id")
+            $client = New-Object System.Net.Http.HttpClient
+            foreach ($k in $headers.Keys) { $client.DefaultRequestHeaders.Add($k, $headers[$k]) }
+            $resp = $client.PostAsync($env:CALLBACK_URL, $content).Result
+            $body = $resp.Content.ReadAsStringAsync().Result
+            Write-Host "Callback response status: $($resp.StatusCode.Value__)"
+            Write-Host "Callback body: $body"
+            if (-not ($resp.IsSuccessStatusCode)) {
+              Write-Host "POST to callback returned non-success status. Exiting with code 3."
+              exit 3
+            }
+          } catch {
+            Write-Host "Exception posting to callback: $_"
+            exit 3
+          } finally {
+            if ($fileStream) { $fileStream.Dispose() }
+            if ($client) { $client.Dispose() }
+          }
 
-      # 10. Mark workflow success
+      # 12) Upload built EXE as artifact (fallback)
+      - name: Upload built EXE as artifact (fallback)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exam-installer-${{ github.run_id }}
+          path: ${{ env.FILE_PATH }}
+
+      # 13) Build completed
       - name: Completed
+        if: success()
         run: echo "Build completed successfully"
