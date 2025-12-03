@@ -25,25 +25,54 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (cache npm)
+      - name: Setup Node.js (v18) and enable npm cache
         uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
+          cache-dependency-path: package-lock.json
 
-      - name: Install dependencies (npm ci)
+      - name: Show runner + node info (debug)
         run: |
+          echo "Runner OS: $RUNNER_OS"
+          node --version || true
+          npm --version || true
+          echo "npm config:"
+          npm config list || true
+
+      - name: Install dependencies (npm ci with retries, fallback to npm install)
+        shell: bash
+        env:
+          NPM_CONFIG_FETCH_RETRIES: 3
+          NPM_CONFIG_FETCH_TIMEOUT: 60000
+          NPM_CONFIG_LOGLEVEL: verbose
+        run: |
+          set -euo pipefail
           if [ -f package-lock.json ]; then
-            npm ci
+            echo "Using npm ci (lockfile exists)"
+            n=0
+            until [ $n -ge 3 ]
+            do
+              n=$((n+1))
+              echo "npm ci attempt #$n"
+              npm ci && break
+              echo "npm ci failed (attempt $n)"
+              sleep $((n * 2))
+            done
+            if [ ! -d node_modules ]; then
+              echo "npm ci failed after retries, falling back to npm install (may be slower)"
+              npm install --legacy-peer-deps
+            fi
           else
-            npm install
+            echo "No package-lock.json found — using npm install"
+            npm install --legacy-peer-deps
           fi
 
       - name: Create data directory
         run: |
           mkdir -p ./data
 
-      - name: print inputs
+      - name: Print inputs (debug)
         run: |
           echo "exam_sql_url=${{ github.event.inputs.exam_sql_url }}"
           echo "exam_filename=${{ github.event.inputs.exam_filename }}"
@@ -88,6 +117,13 @@ jobs:
             exit 1
           fi
 
+      - name: Upload download debug logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-debug-${{ github.run_id }}
+          path: debug_artifact/**
+
       - name: Show downloaded DB
         run: |
           echo "Contents of data/:"
@@ -125,16 +161,30 @@ jobs:
             exit 2
           }
           Write-Host "Posting installer $env:FILE_PATH to $env:CALLBACK_URL"
-          $resp = curl -X POST $env:CALLBACK_URL `
-            -H "X-BUILD-CALLBACK-TOKEN: ${{ secrets.BUILD_CALLBACK_TOKEN }}" `
-            -F "build_id=$env:BUILD_ID" `
-            -F "artifact=@$env:FILE_PATH" `
-            -i --silent
-          Write-Host "Callback response:"
-          Write-Host $resp
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "POST to callback failed (exit $LASTEXITCODE). Uploading artifact to GitHub as fallback."
+          $headers = @{ "X-BUILD-CALLBACK-TOKEN" = "${{ secrets.BUILD_CALLBACK_TOKEN }}" }
+          try {
+            $fileStream = [System.IO.File]::OpenRead($env:FILE_PATH)
+            $content = New-Object System.Net.Http.MultipartFormDataContent
+            $fileContent = New-Object System.Net.Http.StreamContent($fileStream)
+            $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/octet-stream")
+            $content.Add($fileContent, "artifact", [System.IO.Path]::GetFileName($env:FILE_PATH))
+            $content.Add([System.Net.Http.StringContent]::new($env:BUILD_ID), "build_id")
+            $client = New-Object System.Net.Http.HttpClient
+            foreach ($k in $headers.Keys) { $client.DefaultRequestHeaders.Add($k, $headers[$k]) }
+            $resp = $client.PostAsync($env:CALLBACK_URL, $content).Result
+            $body = $resp.Content.ReadAsStringAsync().Result
+            Write-Host "Callback response status: $($resp.StatusCode.Value__)"
+            Write-Host "Callback body: $body"
+            if (-not ($resp.IsSuccessStatusCode)) {
+              Write-Host "POST to callback returned non-success status. Exiting with code 3."
+              exit 3
+            }
+          } catch {
+            Write-Host "Exception posting to callback: $_"
             exit 3
+          } finally {
+            if ($fileStream) { $fileStream.Dispose() }
+            if ($client) { $client.Dispose() }
           }
 
       - name: Upload built EXE as artifact (fallback)
