@@ -94,7 +94,7 @@ jobs:
           MAX=3
           SLEEP=3
           i=0
-          while [ $i -lt $MAX ]; do
+          while ([ $i -lt $MAX ]); do
             i=$((i+1))
             echo "Attempt #$i" | tee -a $LOG
             curl -fSL -D $HEADERS -o "data/${{ github.event.inputs.exam_filename }}" -v "${{ github.event.inputs.exam_sql_url }}" 2>> $LOG || true
