@@ -9,8 +9,8 @@
     "dist": "electron-builder --publish never"
   },
   "build": {
-    "appId": "com.yourorg.examsuite",
-    "productName": "ExamSuite",
+    "appId": "ctep.catsol.ng.exam-suite",
+    "productName": "CTep Admin Suite",
     "files": [
       "src/**/*",
       "assets/**/*",
@@ -36,11 +36,12 @@
     }
   },
   "dependencies": {
-    "better-sqlite3": "^8.1.0",
-    "electron-is-dev": "^2.0.0"
+    "sqlite3": "^5.1.7",
+    "electron-is-dev": "^2.0.0",
+    "bcryptjs": "^3.0.3"
   },
   "devDependencies": {
-    "electron": "^26.0.0",
+    "electron": "^29.0.0",
     "electron-builder": "^24.6.0"
   }
 }
